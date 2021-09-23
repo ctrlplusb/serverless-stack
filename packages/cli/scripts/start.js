@@ -538,7 +538,11 @@ async function handleTranspileNode(
           fullPath,
           outSrcPath
         );
-    if (server) server.drain({ srcPath: handler, outPath: outSrcPath });
+    if (server)
+      server.drain({
+        srcPath: path.join(srcPath, handler),
+        outPath: outSrcPath,
+      });
 
     onSuccess({
       tsconfig,
@@ -1302,7 +1306,7 @@ async function onClientMessage(message) {
       },
     })
     .then((data) => {
-      handleResponse({ type: "success", data });
+      handleResponse(data);
       printLambdaResponse();
       sendLambdaResponse();
     });

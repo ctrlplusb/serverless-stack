@@ -1,5 +1,6 @@
 import Fastify, { FastifyInstance } from "fastify";
 import spawn from "cross-spawn";
+import path from "path";
 import { ChildProcess } from "child_process";
 import crypto from "crypto";
 
@@ -21,7 +22,7 @@ type InvokeOpts = {
   function: Runner.Opts;
   payload: Payload;
   runtime: string;
-  environment: Record<string, string>;
+  env: Record<string, string>;
 };
 
 type Response = any;
@@ -53,8 +54,7 @@ export class Server {
           payload.context.clientContext || {}
         ),
       });
-
-      res.send(payload);
+      res.send(payload.event);
     });
 
     this.fastify.post<{
@@ -66,6 +66,19 @@ export class Server {
       `/:fun/${API_VERSION}/runtime/invocation/:awsRequestId/response`,
       (req, res) => {
         this.success(req.params.fun, req.params.awsRequestId, req.body);
+        res.code(202).send("ok");
+      }
+    );
+
+    this.fastify.post<{
+      Params: {
+        fun: string;
+        awsRequestId: string;
+      };
+    }>(
+      `/:fun/${API_VERSION}/runtime/invocation/:awsRequestId/error`,
+      (req, res) => {
+        this.failure(req.params.fun, req.params.awsRequestId, req.body);
         res.code(202).send("ok");
       }
     );
@@ -120,13 +133,22 @@ export class Server {
   }
 
   private static generateFunctionID(opts: Runner.Opts) {
-    return crypto.createHash("sha256").update(opts.srcPath).digest("hex");
+    return crypto
+      .createHash("sha256")
+      .update(path.normalize(opts.srcPath))
+      .digest("hex");
   }
 
   public success(fun: string, request: string, response: Response) {
     const pool = this.pool(fun);
     const r = pool.requests[request];
-    r(response);
+    r({ type: "success", data: response });
+  }
+
+  public failure(fun: string, request: string, response: Response) {
+    const pool = this.pool(fun);
+    const r = pool.requests[request];
+    r({ type: "failure", error: response });
   }
 
   private async trigger(fun: string, opts: InvokeOpts) {
@@ -137,12 +159,13 @@ export class Server {
     pool.pending.push(opts.payload);
     const cmd = Runner.resolve(opts.runtime)(opts.function);
     const api = `http://127.0.0.1:${this.opts.port}/${fun}`;
+    const env = {
+      ...opts.env,
+      ...cmd.env,
+      AWS_LAMBDA_RUNTIME_API: api,
+    };
     const proc = spawn(cmd.command, cmd.args, {
-      env: {
-        ...opts.environment,
-        ...cmd.env,
-        AWS_LAMBDA_RUNTIME_API: api,
-      },
+      env,
       stdio: "inherit",
     });
     pool.processes.push(proc);
