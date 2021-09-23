@@ -33,7 +33,10 @@ export class Server {
   private readonly opts: ServerOpts;
 
   constructor(opts: ServerOpts) {
-    this.fastify = Fastify();
+    this.fastify = Fastify({
+      // Invocation payload limit here: https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html
+      bodyLimit: 1024 * 1024 * 6,
+    });
     this.opts = opts;
 
     this.fastify.get<{
