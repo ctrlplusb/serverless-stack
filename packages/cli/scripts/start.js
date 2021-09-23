@@ -1,6 +1,5 @@
 "use strict";
 
-const os = require("os");
 const zlib = require("zlib");
 const path = require("path");
 const util = require("util");
@@ -14,6 +13,7 @@ const {
   logger,
   getChildLogger,
   STACK_DEPLOY_STATUS,
+  Runtime,
 } = require("@serverless-stack/core");
 const s3 = new AWS.S3();
 
@@ -44,7 +44,6 @@ const Watcher = require("./util/Watcher");
 const objectUtil = require("../lib/object");
 const CdkWatcherState = require("./util/CdkWatcherState");
 const LambdaWatcherState = require("./util/LambdaWatcherState");
-const LambdaRuntimeServer = require("./util/LambdaRuntimeServer");
 const { serializeError, deserializeError } = require("../lib/serializeError");
 
 // Setup logger
@@ -60,7 +59,7 @@ let watcher;
 let cdkWatcherState;
 let lambdaWatcherState;
 let esbuildService;
-let lambdaServer;
+let server;
 let debugEndpoint;
 let debugBucketArn;
 let debugBucketName;
@@ -307,8 +306,10 @@ async function startWatcher() {
 }
 async function startRuntimeServer(port) {
   // note: 0.0.0.0 does not work on Windows
-  lambdaServer = new LambdaRuntimeServer();
-  await lambdaServer.start("127.0.0.1", port);
+  server = new Runtime.Server({
+    port: port + 1,
+  });
+  server.listen();
 }
 function addInputListener() {
   if (IS_TEST) {
@@ -537,6 +538,7 @@ async function handleTranspileNode(
           fullPath,
           outSrcPath
         );
+    if (server) server.drain({ srcPath: handler, outPath: outSrcPath });
 
     onSuccess({
       tsconfig,
@@ -1281,41 +1283,32 @@ async function onClientMessage(message) {
     return;
   }
 
-  // Add request to RUNTIME server
-  clientLogger.debug("Adding request to RUNTIME server...");
-  lambdaServer.addRequest({
-    debugRequestId,
-    timeoutAt,
-    event,
-    context,
-    onSuccess: (data) => {
-      clientLogger.trace("onSuccess", data);
+  clientLogger.debug("Invoking local function...");
+  server
+    .invoke({
+      runtime,
+      function: {
+        srcPath: getHandlerFullPosixPath(debugSrcPath, debugSrcHandler),
+        outPath: path.join(transpiledHandler.srcPath, transpiledHandler.entry),
+      },
+      env: {
+        ...getSystemEnv(),
+        ...env,
+      },
+      payload: {
+        event,
+        context,
+        deadline: timeoutAt,
+      },
+    })
+    .then((data) => {
       handleResponse({ type: "success", data });
-
-      // Stop Lambda process
-      process.kill(lambda.pid, "SIGKILL");
-    },
-    onFailure: (data) => {
-      clientLogger.trace("onFailure", data);
-
-      // Transform error to Node error b/c the stub Lambda is in Node
-      const error = new Error();
-      error.name = data.errorType;
-      error.message = data.errorMessage;
-      delete error.stack;
-      handleResponse({
-        type: "failure",
-        error: serializeError(error),
-        rawError: data,
-      });
-
-      // Stop Lambda process
-      process.kill(lambda.pid, "SIGKILL");
-    },
-  });
+      printLambdaResponse();
+      sendLambdaResponse();
+    });
 
   // Invoke local function
-  clientLogger.debug("Invoking local function...");
+  /*
   let lambdaLastStdData;
   let lambda;
   if (isNodeRuntime(runtime)) {
@@ -1469,10 +1462,11 @@ async function onClientMessage(message) {
     sendLambdaResponse();
     clearTimeout(timer);
   });
+  */
 
   // Start timeout timer
-  const timer = startLambdaTimeoutTimer(lambda, handleResponse, timeoutAt);
-  clientLogger.debug("Lambda timeout timer started");
+  // const timer = startLambdaTimeoutTimer(lambda, handleResponse, timeoutAt);
+  // clientLogger.debug("Lambda timeout timer started");
 
   function parseEventSource(event) {
     try {
@@ -1642,25 +1636,6 @@ async function onClientMessage(message) {
   }
 }
 
-function startLambdaTimeoutTimer(lambda, handleResponse, timeoutAt) {
-  clientLogger.debug("Called");
-
-  // Calculate ms left for the function execution. Do not use the
-  // `debugRequestTimeoutInMs` value because time has passed since the
-  // request was received (ie. time spent to spawn). If `debugRequestTimeoutInMs`
-  // were used, calling getRemainingTimeInMillis() inside the function code
-  // can return negative value.
-  return setTimeout(function () {
-    handleResponse({ type: "timeout" });
-
-    try {
-      clientLogger.debug("Killing timed out Lambda function");
-      process.kill(lambda.pid, "SIGKILL");
-    } catch (e) {
-      clientLogger.error("Failed to kill timed out Lambda", e);
-    }
-  }, timeoutAt - Date.now());
-}
 function addExtensionToHandler(handler, extension) {
   return handler.replace(/\.[\w\d]+$/, extension);
 }
