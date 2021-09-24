@@ -169,6 +169,8 @@ export class Server {
   public response(fun: string, request: string, response: Response) {
     const pool = this.pool(fun);
     const r = pool.requests[request];
+    if (!r) return;
+    delete pool.requests[request];
     r(response);
   }
 
