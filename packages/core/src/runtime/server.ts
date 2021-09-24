@@ -2,7 +2,10 @@ import Fastify, { FastifyInstance } from "fastify";
 import spawn from "cross-spawn";
 import path from "path";
 import { ChildProcess } from "child_process";
+import { getChildLogger } from "../logger";
 import crypto from "crypto";
+
+const logger = getChildLogger("client");
 
 import * as Runner from "./runner";
 
@@ -25,7 +28,19 @@ type InvokeOpts = {
   env: Record<string, string>;
 };
 
-type Response = any;
+type ResponseSuccess = {
+  type: "success";
+  data: any;
+};
+type ResponseTimeout = {
+  type: "timeout";
+};
+type ResponseFailure = {
+  type: "failure";
+  error: any;
+};
+
+type Response = ResponseSuccess | ResponseFailure | ResponseTimeout;
 
 export class Server {
   private readonly fastify: FastifyInstance;
@@ -44,6 +59,7 @@ export class Server {
         fun: string;
       };
     }>(`/:fun/${API_VERSION}/runtime/invocation/next`, async (req, res) => {
+      logger.debug("Worker waiting for function", req.params.fun);
       const payload = await this.next(req.params.fun);
       res.headers({
         "Lambda-Runtime-Aws-Request-Id": payload.context.awsRequestId,
@@ -68,7 +84,10 @@ export class Server {
     }>(
       `/:fun/${API_VERSION}/runtime/invocation/:awsRequestId/response`,
       (req, res) => {
-        this.success(req.params.fun, req.params.awsRequestId, req.body);
+        this.response(req.params.fun, req.params.awsRequestId, {
+          type: "success",
+          data: req.body,
+        });
         res.code(202).send("ok");
       }
     );
@@ -81,13 +100,17 @@ export class Server {
     }>(
       `/:fun/${API_VERSION}/runtime/invocation/:awsRequestId/error`,
       (req, res) => {
-        this.failure(req.params.fun, req.params.awsRequestId, req.body);
+        this.response(req.params.fun, req.params.awsRequestId, {
+          type: "failure",
+          error: req.body,
+        });
         res.code(202).send("ok");
       }
     );
   }
 
   listen() {
+    logger.debug("Starting runtime server on port:", this.opts.port);
     this.fastify.listen({
       port: this.opts.port,
     });
@@ -126,6 +149,7 @@ export class Server {
   }
 
   public async drain(opts: Runner.Opts) {
+    console.log("Draining", opts.srcPath);
     const fun = Server.generateFunctionID(opts);
     const pool = this.pool(fun);
     for (const proc of pool.processes) {
@@ -139,34 +163,32 @@ export class Server {
     return crypto
       .createHash("sha256")
       .update(path.normalize(opts.srcPath))
-      .digest("hex");
+      .digest("hex")
+      .substr(0, 8);
   }
 
-  public success(fun: string, request: string, response: Response) {
+  public response(fun: string, request: string, response: Response) {
     const pool = this.pool(fun);
     const r = pool.requests[request];
-    r({ type: "success", data: response });
-  }
-
-  public failure(fun: string, request: string, response: Response) {
-    const pool = this.pool(fun);
-    const r = pool.requests[request];
-    r({ type: "failure", error: response });
+    r(response);
   }
 
   private async trigger(fun: string, opts: InvokeOpts) {
+    logger.debug("Triggering", fun, "with", opts.function);
     const pool = this.pool(fun);
     const w = pool.waiting.pop();
     if (w) return w(opts.payload);
     // Spawn new worker if one not immediately available
     pool.pending.push(opts.payload);
     const cmd = Runner.resolve(opts.runtime)(opts.function);
-    const api = `http://127.0.0.1:${this.opts.port}/${fun}`;
+    const api = `127.0.0.1:${this.opts.port}/${fun}`;
+    console.log(api);
     const env = {
       ...opts.env,
       ...cmd.env,
       AWS_LAMBDA_RUNTIME_API: api,
     };
+    logger.debug("Spawning", cmd);
     const proc = spawn(cmd.command, cmd.args, {
       env,
       stdio: "inherit",
