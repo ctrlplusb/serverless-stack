@@ -24,7 +24,6 @@ type Payload = {
 type InvokeOpts = {
   function: Runner.Opts;
   payload: Payload;
-  runtime: string;
   env: Record<string, string>;
 };
 
@@ -180,7 +179,7 @@ export class Server {
     if (w) return w(opts.payload);
     // Spawn new worker if one not immediately available
     pool.pending.push(opts.payload);
-    const cmd = Runner.resolve(opts.runtime)(opts.function);
+    const cmd = Runner.resolve(opts.function.runtime)(opts.function);
     const api = `127.0.0.1:${this.opts.port}/${fun}`;
     console.log(api);
     const env = {

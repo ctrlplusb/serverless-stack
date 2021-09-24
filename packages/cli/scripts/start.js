@@ -1290,8 +1290,8 @@ async function onClientMessage(message) {
   clientLogger.debug("Invoking local function...");
   server
     .invoke({
-      runtime,
       function: {
+        runtime,
         srcPath: getHandlerFullPosixPath(debugSrcPath, debugSrcHandler),
         outPath: "not_implemented",
         transpiledHandler,
