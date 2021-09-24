@@ -148,7 +148,6 @@ export class Server {
   }
 
   public async drain(opts: Runner.Opts) {
-    console.log("Draining", opts.srcPath);
     const fun = Server.generateFunctionID(opts);
     const pool = this.pool(fun);
     for (const proc of pool.processes) {
@@ -183,7 +182,6 @@ export class Server {
     pool.pending.push(opts.payload);
     const cmd = Runner.resolve(opts.function.runtime)(opts.function);
     const api = `127.0.0.1:${this.opts.port}/${fun}`;
-    console.log(api);
     const env = {
       ...opts.env,
       ...cmd.env,
