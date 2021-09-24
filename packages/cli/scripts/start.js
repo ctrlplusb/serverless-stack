@@ -101,7 +101,7 @@ module.exports = async function (argv, config, cliInfo) {
 
   logger.info("");
   logger.info("==========================");
-  logger.info(" Starting Live Lambda Dev Loser");
+  logger.info(" Starting Live Lambda Dev");
   logger.info("==========================");
   logger.info("");
 
