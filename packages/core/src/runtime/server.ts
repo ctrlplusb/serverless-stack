@@ -72,6 +72,11 @@ export class Server {
           payload.context.clientContext || {}
         ),
       });
+      logger.debug(
+        "Sending next payload",
+        payload.context.awsRequestId,
+        req.params.fun
+      );
       res.send(payload.event);
     });
 
@@ -83,6 +88,11 @@ export class Server {
     }>(
       `/:fun/${API_VERSION}/runtime/invocation/:awsRequestId/response`,
       (req, res) => {
+        logger.debug(
+          "Received response for",
+          req.params.awsRequestId,
+          req.params.fun
+        );
         this.response(req.params.fun, req.params.awsRequestId, {
           type: "success",
           data: req.body,
@@ -99,6 +109,11 @@ export class Server {
     }>(
       `/:fun/${API_VERSION}/runtime/invocation/:awsRequestId/error`,
       (req, res) => {
+        logger.debug(
+          "Received error for",
+          req.params.awsRequestId,
+          req.params.fun
+        );
         this.response(req.params.fun, req.params.awsRequestId, {
           type: "failure",
           error: req.body,
@@ -149,6 +164,7 @@ export class Server {
 
   public async drain(opts: Runner.Opts) {
     const fun = Server.generateFunctionID(opts);
+    logger.debug("Draining function", fun);
     const pool = this.pool(fun);
     for (const proc of pool.processes) {
       proc.kill();
@@ -174,7 +190,7 @@ export class Server {
   }
 
   private async trigger(fun: string, opts: InvokeOpts) {
-    logger.debug("Triggering", fun, "with", opts.function);
+    logger.debug("Triggering", fun);
     const pool = this.pool(fun);
     const w = pool.waiting.pop();
     if (w) return w(opts.payload);
@@ -187,7 +203,7 @@ export class Server {
       ...cmd.env,
       AWS_LAMBDA_RUNTIME_API: api,
     };
-    logger.debug("Spawning", cmd);
+    logger.debug("Spawning", cmd.command);
     const proc = spawn(cmd.command, cmd.args, {
       env,
       stdio: "inherit",
