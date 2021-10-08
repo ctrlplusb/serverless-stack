@@ -1,6 +1,6 @@
 {
   "name": "@serverless-stack/resources",
-  "version": "0.45.2",
+  "version": "0.45.3-next.14+71817e86",
   "homepage": "https://serverless-stack.com",
   "description": "Helper AWS CDK constructs for Serverless Stack apps.",
   "main": "dist/index.js",
@@ -64,7 +64,7 @@
     "@aws-cdk/lambda-layer-awscli": "1.125.0",
     "@graphql-tools/load-files": "^6.3.2",
     "@graphql-tools/merge": "^6.2.14",
-    "@serverless-stack/core": "^0.45.2",
+    "@serverless-stack/core": "0.45.3-next.14+71817e86",
     "@serverless-stack/nextjs-lambda": "^0.1.9",
     "@types/jest": "^26.0.7",
     "archiver": "^5.3.0",
@@ -87,5 +87,5 @@
     "@types/fs-extra": "^9.0.6",
     "@types/node": "^14.0.27"
   },
-  "gitHead": "ef4db05a8b92a136204e65a70474ab529e55dbe6"
+  "gitHead": "71817e86d1b16f477da9a24bcca49e2d26a63c72"
 }
