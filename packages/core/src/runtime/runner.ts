@@ -1,6 +1,7 @@
 import path from "path";
 import os from "os";
 import { Paths } from "../util";
+import { Packager } from "../packager";
 
 export type Opts = {
   srcPath: string;
@@ -23,9 +24,11 @@ export const NodeRunner: Handler = (opts) => {
     .join(opts.transpiledHandler.srcPath, opts.transpiledHandler.entry)
     .replace(".js", "." + opts.transpiledHandler.handler);
   return {
-    command: "./node_modules/.bin/aws-lambda-ric",
-    args: [handler],
-    env: {},
+    command: "npm",
+    args: ["run", "aws-lambda-ric", "--", handler],
+    env: {
+      AWS_LAMBDA_NODEJS_USE_ALTERNATIVE_CLIENT_1: "true",
+    },
   };
 };
 
