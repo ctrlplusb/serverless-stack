@@ -57,6 +57,7 @@ function synth(cdkOptions) {
 }
 
 function runCdkSynth(cdkOptions) {
+  console.log("Running cdk synth");
   let child;
 
   // Log all outputs and parse for error helper message if there is an error
@@ -66,6 +67,14 @@ function runCdkSynth(cdkOptions) {
     // Build cdk context
     const context = [];
     (cdkOptions.context || []).forEach((c) => context.push("-c", c));
+
+    const manager = Packager.getManager(process.cwd());
+    manager.run({
+      cmd: "cdk",
+      args: ["synth"],
+      cwd: process.cwd(),
+      verbose: true,
+    });
 
     child = spawn(
       getCdkBinPath(),

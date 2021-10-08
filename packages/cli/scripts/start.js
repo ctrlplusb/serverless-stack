@@ -179,12 +179,18 @@ async function deployDebugStack(argv, config, cliInfo, cacheData) {
     app: `node bin/index.js ${stackName} ${config.stage} ${config.region} ${paths.appPath} ${appBuildLibPath}`,
     output: "cdk.out",
   };
+  const stackPath = path.join(paths.appBuildDir, "debug-stack");
+  console.log("Copying...");
+  fs.copySync(path.join(paths.ownPath, "assets", "debug-stack"), stackPath, {
+    recursive: true,
+  });
+  console.log("Copied!");
 
   // Change working directory
   // Note: When deploying the debug stack, the current working directory is user's app.
   //       Setting the current working directory to debug stack cdk app directory to allow
   //       Lambda Function construct be able to reference code with relative path.
-  process.chdir(path.join(paths.ownPath, "assets", "debug-stack"));
+  process.chdir(stackPath);
 
   // Build
   const cdkManifest = await synth(cdkOptions);

@@ -1,14 +1,12 @@
 "use strict";
 
 const path = require("path");
-const util = require("util");
 const fs = require("fs-extra");
 const chalk = require("chalk");
 const crypto = require("crypto");
 const esbuild = require("esbuild");
-const spawn = require("cross-spawn");
 const sstCore = require("@serverless-stack/core");
-const exec = util.promisify(require("child_process").exec);
+const { Packager } = require("@serverless-stack/core");
 
 const paths = require("./paths");
 const array = require("../../lib/array");
@@ -49,24 +47,6 @@ async function checkFileExists(file) {
 
 function getEsbuildTarget() {
   return "node" + process.version.slice(1);
-}
-
-/**
- * Finds the path to the tsc package executable by converting the file path of:
- * /Users/spongebob/serverless-stack/node_modules/typescript/dist/index.js
- * to:
- * /Users/spongebob/serverless-stack/node_modules/.bin/tsc
- */
-function getTsBinPath() {
-  const pkg = "typescript";
-  const filePath = require.resolve(pkg);
-  const matches = filePath.match(/(^.*[/\\]node_modules)[/\\].*$/);
-
-  if (matches === null || !matches[1]) {
-    throw new Error(`There was a problem finding ${pkg}`);
-  }
-
-  return path.join(matches[1], ".bin", "tsc");
 }
 
 function getCdkBinPath() {
@@ -338,6 +318,7 @@ function runChecks(appliedConfig, inputFiles) {
   return Promise.all(promises);
 }
 async function lint(inputFiles) {
+  // TODO: Temporarily disable
   inputFiles = inputFiles.filter(
     (file) =>
       file.indexOf("node_modules") === -1 &&
@@ -346,22 +327,16 @@ async function lint(inputFiles) {
 
   logger.info(chalk.grey("Linting source"));
 
-  const response = spawn.sync(
-    "node",
-    [
-      path.join(paths.appBuildPath, "eslint.js"),
+  const manager = Packager.getManager(paths.appPath);
+  const response = manager.run({
+    cwd: paths.appPath,
+    verbose: true,
+    cmd: "eslint",
+    args: [
       process.env.NO_COLOR === "true" ? "--no-color" : "--color",
       ...inputFiles,
     ],
-    // Using the ownPath instead of the appPath because there are cases
-    // where npm flattens the dependecies and this casues eslint to be
-    // unable to find the parsers and plugins. The ownPath hack seems
-    // to fix this issue.
-    // https://github.com/serverless-stack/serverless-stack/pull/68
-    // Steps to replicate, repo: https://github.com/jayair/sst-eu-example
-    // Do `yarn add standard -D` and `sst build`
-    { stdio: "inherit", cwd: paths.ownPath }
-  );
+  });
 
   if (response.error) {
     logger.info(response.error);
@@ -383,31 +358,25 @@ async function typeCheck(inputFiles) {
   }
 
   logger.info(chalk.grey("Running type checker"));
+  const manager = Packager.getManager(paths.appPath);
 
-  try {
-    const { stdout, stderr } = await exec(
-      [
-        getTsBinPath(),
-        "--pretty",
-        process.env.NO_COLOR === "true" ? "false" : "true",
-        "--noEmit",
-      ].join(" "),
-      { cwd: paths.appPath }
-    );
-    if (stdout) {
-      logger.info(stdout);
-    }
-    if (stderr) {
-      logger.info(stderr);
-    }
-  } catch (e) {
-    if (e.stdout) {
-      logger.info(e.stdout);
-    } else if (e.stderr) {
-      logger.info(e.stderr);
-    } else {
-      logger.info(e);
-    }
+  const result = manager.run({
+    cwd: paths.appPath,
+    verbose: false,
+    cmd: "tsc",
+    args: [
+      "--pretty",
+      process.env.NO_COLOR === "true" ? "false" : "true",
+      "--noEmit",
+    ],
+  });
+  if (result.stdout) {
+    logger.info(result.stdout.toString());
+  }
+  if (result.stderr) {
+    logger.info(result.stderr.toString());
+  }
+  if (result.status !== 0) {
     throw new Error("There was a problem type checking the source.");
   }
 }
@@ -634,7 +603,6 @@ module.exports = {
   generateStackChecksums,
 
   sleep,
-  getTsBinPath,
   getCdkBinPath,
   getEsbuildTarget,
   checkFileExists,
