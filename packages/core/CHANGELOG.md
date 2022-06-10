@@ -1,5 +1,11 @@
 # @serverless-stack/core
 
+## 1.2.20
+
+### Patch Changes
+
+- [#1793](https://github.com/serverless-stack/serverless-stack/pull/1793) [`960575f0`](https://github.com/serverless-stack/serverless-stack/commit/960575f0a66ba1b12806244b728f7fb6254674bc) Thanks [@fwang](https://github.com/fwang)! - Cli: check for invalid stages names
+
 ## 1.2.19
 
 ## 1.2.18
