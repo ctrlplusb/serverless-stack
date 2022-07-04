@@ -1,25 +1,20 @@
-// This is a custom CloudFront Lambda@Edge handler which we will utilise to wrap
-// the Remix server build with.
-//
-// It additionally exposes an environment variable token which is used by our
-// Lambda Replacer code to inject the appropriate environment variables. This
-// strategy is required as Lambda@Edge doesn't natively support environment
-// variables - they need to be inlined.
-//
-// Shout out to the Architect team, from which we drew inspiration.
+// This is a custom CloudFront Lambda@Edge handler which imports the Remix server
+// build and performs the Remix server rendering.
 
-const { installGlobals, readableStreamToString } = require("@remix-run/node");
-installGlobals();
+// We have to ensure that our polyfills are imported prior to any other modules
+// which may depend on them;
+import "./polyfills.js";
 
-const {
-  Headers: NodeHeaders,
-  Request: NodeRequest,
-} = require("@remix-run/node");
-const {
-  createRequestHandler: createRemixRequestHandler,
-} = require("@remix-run/server-runtime");
-const { URL } = require("url");
-const remixServerBuild = require("./index.js");
+import { readableStreamToString } from "@remix-run/node";
+import {
+  Headers as NodeHeaders,
+  Request as NodeRequest,
+} from "@remix-run/node";
+import { createRequestHandler as createRemixRequestHandler } from "@remix-run/server-runtime";
+import { URL } from "url";
+
+// Import the server build that was produced by `remix build`;
+import * as remixServerBuild from "./index.js";
 
 /**
  * Common binary MIME types
@@ -135,21 +130,32 @@ function createCloudFrontResponseHeaders(responseHeaders) {
   return headers;
 }
 
-function createCloudFrontRequestHandler({
-  remixServerBuild,
-  getLoadContext,
-  mode = process.env.NODE_ENV,
-}) {
-  const remixRequestHandler = createRemixRequestHandler(remixServerBuild, mode);
+function createCloudFrontEdgeRequestHandler(build) {
+  // We expose an environment variable token which is used by our Lambda Replacer
+  // code to inject the environment variables assigned to the RemixSite construct.
+  // This inlining strategy is required as Lambda@Edge doesn't natively support
+  // runtime environment variables. A downside of this approach is that environment
+  // variables cannot be toggled after deployment, each change to one requires a
+  // redeployment.
+  try {
+    // The right hand side of this assignment will get replaced during
+    // deployment with an object of environment key-value pairs;
+    const environment = "{{ _SST_REMIX_SITE_ENVIRONMENT_ }}";
+
+    process.env = { ...process.env, ...environment };
+  } catch (e) {
+    console.log("Failed to set SST RemixSite environment.");
+    console.log(e);
+  }
+
+  const remixRequestHandler = createRemixRequestHandler(
+    build,
+    process.env.NODE_ENV
+  );
 
   return async (event, _context) => {
     const request = createNodeRequest(event);
-
-    const loadContext =
-      typeof getLoadContext === "function" ? getLoadContext(event) : undefined;
-
-    const response = await remixRequestHandler(request, loadContext);
-
+    const response = await remixRequestHandler(request);
     const contentType = response.headers.get("Content-Type");
     const isBase64Encoded = isBinaryType(contentType);
 
@@ -172,21 +178,4 @@ function createCloudFrontRequestHandler({
   };
 }
 
-const cloudFrontRequestHandler = createCloudFrontRequestHandler({
-  remixServerBuild,
-});
-
-exports.handler = async function handler(...args) {
-  try {
-    // The right hand side of this assignment will get replaced during
-    // deployment with an object of environment key-value pairs;
-    const environment = "{{ _SST_REMIX_SITE_ENVIRONMENT_ }}";
-
-    process.env = { ...process.env, ...environment };
-  } catch (e) {
-    console.log("Failed to set SST RemixSite environment.");
-    console.log(e);
-  }
-
-  return await cloudFrontRequestHandler(...args);
-};
+export const handler = createCloudFrontEdgeRequestHandler(remixServerBuild);

@@ -9,20 +9,23 @@ description: "Docs for the sst.RemixSite construct in the @serverless-stack/reso
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 -->
 The `RemixSite` construct is a higher level CDK construct that makes it easy
-to create a Remix app.
+to create a Remix app. It provides a simple way to build and deploy your site
+to CloudFront.
 
-It provides a simple way to build and deploy the site to CloudFront, the
-server running on `Lambda@Edge`, with the browser build and public statics
-backed by an S3 Bucket. In addition to this it supports environment variables
-against your `Lambda@Edge` function, despite this being a limitation with the
-AWS feature. CloudFront cache policies are implemented, along with cache
-invalidation on deployment.
+By default server rendering is performed within an APIGatewayV2 Lambda,
+however, it also supports the use of Lambda@Edge (via the `edge` prop). Additionally
+it supports environment variables against the Lambda@Edge deployment
+despite this being a limitation of Lambda@Edge.
+
+The browser build and public statics are backed by an S3 Bucket. CloudFront
+cache policies are configured, whilst also allowing for customization, and we
+include cache invalidation on deployment.
 
 The construct enables you to customize many of the deployment features,
 including the ability to configure a custom domain for the website URL.
 
-It also allows you to [automatically set the environment
-variables](#configuring-environment-variables) in your Remix app directly
+It enables you to [automatically set the environment
+variables](#configuring-environment-variables) for your Remix app directly
 from the outputs in your SST app.
 
 
@@ -37,9 +40,9 @@ _Parameters_
 
 ### Creating a Remix app
 
-We recommend the following process to bootstrap a Remix application that will be compatible with this construct.
+We recommend bootstrapping your Remix application via the following steps in order to ensure maximum compatibility with this construct;
 
-1. Within the root of your SST project run the Remix CLI to create an application;
+1. Within your SST project run the Remix CLI to create an application;
 
    ```bash title="Create a Remix application"
    npx create-remix@latest
@@ -49,7 +52,7 @@ We recommend the following process to bootstrap a Remix application that will be
 
    ![Selecting "Remix App Server" deployment](/img/remix/bootstrap-remix.png)
 
-3. After the installation has complete add the following dependency to your Remix application;
+3. After the installation has completed add the following dependency to your Remix application's `package.json`;
 
    ```bash title="Install sst-env"
    npm install --save-dev @serverless-stack/static-site-env
@@ -57,7 +60,7 @@ We recommend the following process to bootstrap a Remix application that will be
 
    > Or use your package manager of choices form of the above.
 
-4. Update your package.json scripts;
+4. Update the package.json scripts for your Remix application;
 
    ```diff title="Update package.json scripts"
      "scripts": {
@@ -79,25 +82,12 @@ We recommend the following process to bootstrap a Remix application that will be
 > **Note**
 >
 > We depend on your "build" script to bundle your Remix application. We are aware that Remix does not enable you to customise their underlying build configuration and that it is often the case that the "build" script is extended to perform additional functions such as Tailwind compilation. Therefore we feel that targetting the "build" script rather than the `remix build` command directly will ensure that all your required build artifacts are available prior to deployment.
+>
+> The `path` **must** be pointing to the root of your Remix application.
 
 ### Environment variables
 
 The `RemixSite` construct allows you to set the environment variables in your Remix app based on outputs from other constructs in your SST app. So you don't have to hard code the config from your backend. Let's look at how.
-
-Remix only supports environment variables in the server build. If your require environment variables within your routes/components then we recommend that you [follow their documentation](https://remix.run/docs/en/v1/guides/envvars#browser-environment-variables), returning the required environment variables within the `loader` associated within your Remix route.
-
-```js title="app/routes/index.tsx"
-// Loaders will only be included in your server build and the environment
-// variables will be available;
-export async function loader() {
-  return json({
-    ENV: {
-      apiUrl: process.env.API_URL,
-      userPoolClient: process.env.USER_POOL_CLIENT,
-    }
-  });
-}
-```
 
 To expose environment variables to your Remix application you should utilise the `RemixSite` construct `environment` configuration property rather than an `.env` file within your Remix application root.
 
@@ -113,18 +103,14 @@ new RemixSite(this, "RemixSite", {
 
 Where `api.url` or `auth.cognitoUserPoolClient.userPoolClientId` are coming from other constructs in your SST app.
 
-#### While deploying
-
-On `sst deploy` we deploy your Remix server to Lamba@Edge, which does not support runtime environment. To get around this limitation the environment variables will first be replaced by placeholder values, `{{ API_URL }}` and `{{ USER_POOL_CLIENT }}`, when building the Remix app. And after the referenced resources have been created, the Api and User Pool in this case, the placeholders in the server JS will then be replaced with the actual values.
-
 :::caution
-We only replace environment variables within the code that is deployed to your Lamba@Edge. i.e. the server for your Remix application. This keeps in line with Remix's expectations laid out in their documentation.
+Remix only supports environment variables within the server runtime environment. It does not inline replace environment variables like some other solutions (e.g. Create React App).
 
-Do not use environment variables (e.g. `process.env.API_URL`) directly within any components that will be included in the browser build for your Remix application. You should instead pass the environment variables down via your route `loader`;
+If your require environment variables within your routes/components then we recommend that you [follow their guide](https://remix.run/docs/en/v1/guides/envvars#browser-environment-variables), returning the required environment variables within the `loader` associated within your Remix route.
 
-```javascript
-// Loaders will only be included in your server build and the environment
-// variables will hence be substituted in the deployment process;
+```js title="app/routes/index.tsx"
+// Loaders will only be included in your server build. Therefore the environment
+// variables will be available;
 export async function loader() {
   return json({
     ENV: {
@@ -135,7 +121,31 @@ export async function loader() {
 }
 ```
 
-You can read more about this strategy within the [Remix documentation](https://remix.run/docs/en/v1/guides/envvars#browser-environment-variables).
+If other modules within your application require access to an environment variable then we recommend that you pass the environment variable to the respective module via the loader;
+
+```js title="app/routes/index.tsx"
+import apiClient from "~/lib/api-client.js";
+
+export async function loader() {
+  const articles = await apiClient(process.env.API_URL).fetchArticles();
+
+  return json({
+    articles
+  });
+}
+```
+:::
+
+#### While deploying
+
+On `sst deploy` we deploy your Remix server.
+
+:::caution
+If you configured your `RemixSite` to deploy to Lamba@Edge, it is important to understand that Lambda@Edge does not support runtime environment variables.
+
+To get around this limitation your environment variables will first be replaced by placeholder values, `{{ API_URL }}` and `{{ USER_POOL_CLIENT }}`. After the referenced resources have been created, the Api and User Pool in this case, the placeholders in the Lambda JS will be replaced with the actual values.
+
+We only replace environment variables within the code that is deployed to your Lamba@Edge. i.e. the server for your Remix application. Deployments to APIGatewayV2 support runtime environment variables.
 :::
 
 #### While developing
@@ -184,6 +194,16 @@ There are a couple of things happening behind the scenes here:
   remix-app/
 ```
 :::
+
+
+### Deploying to Lamba@Edge
+
+```js {3}
+new RemixSite(this, "Site", {
+  path: "path/to/site",
+  edge: true,
+});
+```
 
 ### Custom domains
 
@@ -375,6 +395,12 @@ new RemixSite(this, "Site2", {
 ## RemixSiteProps
 
 
+### bundle?
+
+_Type_ : <span class="mono">[FunctionBundleNodejsProps](Function#functionbundlenodejsprops)</span>
+
+Pass in a custom bundling configuration for the server lambda.
+
 ### customDomain?
 
 _Type_ : <span class='mono'><span class="mono">string</span> | <span class="mono">[RemixDomainProps](#remixdomainprops)</span></span>
@@ -419,6 +445,8 @@ _Type_ : <span class="mono">number</span>
 
 
 
+Override the configuration for the server render Lambda.
+
 ### disablePlaceholder?
 
 _Type_ : <span class="mono">boolean</span>
@@ -435,10 +463,19 @@ new RemixSite(stack, "RemixSite", {
 });
 ```
 
+### edge?
 
+_Type_ : <span class="mono">boolean</span>
 
+_Default_ : <span class="mono">false</span>
 
-z
+If `true` your RemixSite server render handler will be deployed to
+Lambda@Edge, else it will be deployed as an APIGatewayV2 Lambda.
+
+### environment?
+
+_Type_ : <span class="mono">Record&lt;<span class="mono">string</span>, <span class="mono">string</span>&gt;</span>
+
 An object with the key being the environment variable name.
 
 
@@ -501,6 +538,11 @@ Override the CloudFront cache policy properties for responses from the
 server rendering Lambda.
 
 
+
+The default cache policy that is used in the abscene of this property
+is one that performs no caching of the server response.
+
+
 Override the default CloudFront cache policies created internally.
 
 ### cdk.distribution?
@@ -510,6 +552,8 @@ _Type_ : <span class="mono">[RemixCdkDistributionProps](#remixcdkdistributionpro
 Pass in a value to override the default settings this construct uses to
 create the CDK `Distribution` internally.
 
+
+Customise aspects of the CDK deployment.
 
 ## Properties
 An instance of `RemixSite` has the following properties.
@@ -556,8 +600,11 @@ _Type_ : <span class="mono">[CachePolicyProps](https://docs.aws.amazon.com/cdk/a
 
 The default CloudFront cache policy properties for "public" folder
 static files.
-Note: This will not include the browser build files, which have a seperate
-cache policy; @see `browserBuildCachePolicyProps`.
+
+
+
+This policy is not applied to the browser build files; they have a seperate
+cache policy. @see `browserBuildCachePolicyProps`.
 
 ### serverResponseCachePolicyProps
 
@@ -565,6 +612,10 @@ _Type_ : <span class="mono">[CachePolicyProps](https://docs.aws.amazon.com/cdk/a
 
 The default CloudFront cache policy properties for responses from the
 server rendering Lambda.
+
+
+
+By default no caching is performed on the server rendering Lambda response.
 
 ### url
 
@@ -597,6 +648,8 @@ _Type_ : <span class="mono">[IHostedZone](https://docs.aws.amazon.com/cdk/api/v2
 
 The Route 53 hosted zone for the custom domain.
 
+
+Exposes CDK instances created within the construct.
 
 ## Methods
 An instance of `RemixSite` has the following methods.

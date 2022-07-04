@@ -1,6 +1,4 @@
 import { test, expect, beforeAll, vi } from "vitest";
-import path from "path";
-import fs from "fs-extra";
 import { execSync } from "child_process";
 import {
   countResources,
@@ -11,7 +9,6 @@ import {
   ANY,
   ABSENT,
 } from "./helper";
-import * as cdk from "aws-cdk-lib";
 import * as cf from "aws-cdk-lib/aws-cloudfront";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
@@ -45,6 +42,7 @@ test("constructor: no domain", async () => {
   const stack = new Stack(new App(), "stack");
   const site = new RemixSite(stack, "Site", {
     path: "test/remix-site",
+    edge: true,
     // @ts-expect-error: "sstTest" is not exposed in props
     sstTest: true,
   });
@@ -63,22 +61,22 @@ test("constructor: no domain", async () => {
       Aliases: [],
       CacheBehaviors: [
         {
-          AllowedMethods: ["GET", "HEAD"],
+          AllowedMethods: ["GET", "HEAD", "OPTIONS"],
           CachePolicyId: {
             Ref: "SiteBrowserBuildAssetsCache280F56B5",
           },
-          CachedMethods: ["GET", "HEAD"],
+          CachedMethods: ["GET", "HEAD", "OPTIONS"],
           Compress: true,
-          PathPattern: "build",
+          PathPattern: "/build/*",
           TargetOriginId: "devmyappstackSiteDistributionOrigin1F25265FA",
           ViewerProtocolPolicy: "redirect-to-https",
         },
         {
-          AllowedMethods: ["GET", "HEAD"],
+          AllowedMethods: ["GET", "HEAD", "OPTIONS"],
           CachePolicyId: {
             Ref: "SitePublicAssetsCache358A0E01",
           },
-          CachedMethods: ["GET", "HEAD"],
+          CachedMethods: ["GET", "HEAD", "OPTIONS"],
           Compress: true,
           PathPattern: "/favicon.ico",
           TargetOriginId: "devmyappstackSiteDistributionOrigin1F25265FA",
@@ -86,7 +84,15 @@ test("constructor: no domain", async () => {
         },
       ],
       DefaultCacheBehavior: {
-        AllowedMethods: ["GET", "HEAD", "OPTIONS"],
+        AllowedMethods: [
+          "GET",
+          "HEAD",
+          "OPTIONS",
+          "PUT",
+          "PATCH",
+          "POST",
+          "DELETE",
+        ],
         CachePolicyId: {
           Ref: "SiteServerResponseCache00237CD2",
         },
@@ -777,6 +783,7 @@ test("constructor: environment generates placeholders", async () => {
   const api = new Api(stack, "Api");
   new RemixSite(stack, "Site", {
     path: "test/remix-site",
+    edge: true,
     environment: {
       CONSTANT_ENV: "my-url",
       REFERENCE_ENV: api.url,
@@ -814,6 +821,7 @@ test("constructor: us-east-1", async () => {
   const stack = new Stack(app, "stack");
   const site = new RemixSite(stack, "Site", {
     path: "test/remix-site",
+    edge: true,
     // @ts-expect-error: "sstTest" is not exposed in props
     sstTest: true,
   });
@@ -840,6 +848,7 @@ test("constructor: ca-central-1", async () => {
   const stack = new Stack(app, "stack");
   const site = new RemixSite(stack, "Site", {
     path: "test/remix-site",
+    edge: true,
     // @ts-expect-error: "sstTest" is not exposed in props
     sstTest: true,
   });
@@ -887,10 +896,7 @@ test("constructor: local debug", async () => {
       Ref: "SiteS3Bucket43E5BB2F",
     },
   });
-  countResources(stack, "Custom::SSTCloudFrontInvalidation", 1);
-  hasResource(stack, "Custom::SSTCloudFrontInvalidation", {
-    DistributionPaths: ["/*"],
-  });
+  countResources(stack, "Custom::SSTCloudFrontInvalidation", 0);
   hasResource(stack, "AWS::CloudFront::Distribution", {
     DistributionConfig: objectLike({
       CustomErrorResponses: [

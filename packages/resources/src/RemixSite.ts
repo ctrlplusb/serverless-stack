@@ -3,18 +3,17 @@ import path from "path";
 import url from "url";
 import fs from "fs-extra";
 import spawn from "cross-spawn";
-import { readPackageSync } from "read-pkg";
-import * as z from "zod";
 import indent from "indent-string";
 
+import { Runtime } from "@serverless-stack/core";
 import { Construct } from "constructs";
 import {
-  Token,
   Duration,
   CfnOutput,
   RemovalPolicy,
   CustomResource,
 } from "aws-cdk-lib";
+import { BehaviorOptions } from "aws-cdk-lib/aws-cloudfront";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -28,63 +27,47 @@ import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
 import * as route53Patterns from "aws-cdk-lib/aws-route53-patterns";
 
+import { Api } from "./Api.js";
 import { App } from "./App.js";
+import { Function, FunctionBundleNodejsProps } from "./Function.js";
 import { Stack } from "./Stack.js";
 import { SSTConstruct } from "./Construct.js";
 import {
   BaseSiteDomainProps,
-  BaseSiteReplaceProps,
   BaseSiteCdkDistributionProps,
   BaseSiteEnvironmentOutputsInfo,
-  getBuildCmdEnvironment,
   buildErrorResponsesForRedirectToIndex,
 } from "./BaseSite.js";
 import { Permissions, attachPermissionsToRole } from "./util/permission.js";
+import * as RemixSiteUtils from "./util/remixSite.js";
+import type { RemixConfig } from "./util/remixSite.js";
 
 // This references a directory named after Nextjs, but the underlying code
 // appears to be generic enough to utilise in this case.
+// I suggest we rename this folder to something like "edge-lambda";
 import * as crossRegionHelper from "./nextjs-site/cross-region-helper.js";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
-
-// This aids us in ensuring the user is providing our expected remix.config.js
-// values. We will follow a required convention as is typical in some of the
-// official Remix templates for other deployment targets.
-// @see https://remix.run/docs/en/v1/api/conventions#remixconfigjs
-const expectedRemixConfigSchema = z.object({
-  // The path to the browser build, relative to remix.config.js. Defaults to
-  // "public/build". Should be deployed to static hosting.
-  assetsBuildDirectory: z.literal("public/build"),
-  // The URL prefix of the browser build with a trailing slash. Defaults to
-  // "/build/". This is the path the browser will use to find assets.
-  // Note: Remix additionally has a "public" folder, which should be considered
-  // different to this. We seperately need to deploy the "public" folder and
-  // ensure the files/directories are mapped relative to the root of the
-  // domain.
-  publicPath: z.literal("/build/"),
-  // The path to the server build file, relative to remix.config.js. This file
-  // should end in a .js extension and should be deployed to your server.
-  serverBuildPath: z.literal("build/index.js"),
-  // The target of the server build.
-  serverBuildTarget: z.literal("node-cjs"),
-  // A server entrypoint, relative to the root directory that becomes your
-  // server's main module. If specified, Remix will compile this file along with
-  // your application into a single file to be deployed to your server.
-  server: z.string().optional(),
-});
-
-type RemixConfig = z.infer<typeof expectedRemixConfigSchema>;
 
 export interface RemixDomainProps extends BaseSiteDomainProps {}
 export interface RemixCdkDistributionProps
   extends BaseSiteCdkDistributionProps {}
 export interface RemixSiteProps {
+  /**
+   * Pass in a custom bundling configuration for the server lambda.
+   */
+  bundle?: FunctionBundleNodejsProps;
+
+  /**
+   * Customise aspects of the CDK deployment.
+   */
   cdk?: {
     /**
      * Pass in bucket information to override the default settings this
      * construct uses to create the CDK Bucket internally.
      */
     bucket?: s3.BucketProps;
+
     /**
      * Pass in a value to override the default settings this construct uses to
      * create the CDK `Distribution` internally.
@@ -109,6 +92,11 @@ export interface RemixSiteProps {
       /**
        * Override the CloudFront cache policy properties for responses from the
        * server rendering Lambda.
+       *
+       * @note
+       *
+       * The default cache policy that is used in the abscene of this property
+       * is one that performs no caching of the server response.
        */
       serverResponseCachePolicy?: cloudfront.ICachePolicy;
     };
@@ -147,7 +135,15 @@ export interface RemixSiteProps {
    */
   customDomain?: string | RemixDomainProps;
 
-  /**z
+  /**
+   * If `true` your RemixSite server render handler will be deployed to
+   * Lambda@Edge, else it will be deployed as an APIGatewayV2 Lambda.
+   *
+   * @default false
+   */
+  edge?: boolean;
+
+  /**
    * An object with the key being the environment variable name.
    *
    * @example
@@ -161,7 +157,7 @@ export interface RemixSiteProps {
    * });
    * ```
    */
-  environment?: { [key: string]: string };
+  environment?: Record<string, string>;
 
   /**
    * When running `sst start`, a placeholder site is deployed. This is to ensure
@@ -178,6 +174,9 @@ export interface RemixSiteProps {
    */
   disablePlaceholder?: boolean;
 
+  /**
+   * Override the configuration for the server render Lambda.
+   */
   defaults?: {
     function?: {
       timeout?: number;
@@ -197,22 +196,32 @@ export interface RemixSiteProps {
   waitForInvalidation?: boolean;
 }
 
+type LambdaSourceMeta = {
+  directory: string;
+  handler: string;
+};
+
+type ServerFunction = Api | lambda.IVersion;
+
 /**
  * The `RemixSite` construct is a higher level CDK construct that makes it easy
- * to create a Remix app.
+ * to create a Remix app. It provides a simple way to build and deploy your site
+ * to CloudFront.
  *
- * It provides a simple way to build and deploy the site to CloudFront, the
- * server running on `Lambda@Edge`, with the browser build and public statics
- * backed by an S3 Bucket. In addition to this it supports environment variables
- * against your `Lambda@Edge` function, despite this being a limitation with the
- * AWS feature. CloudFront cache policies are implemented, along with cache
- * invalidation on deployment.
+ * By default server rendering is performed within an APIGatewayV2 Lambda,
+ * however, it also supports the use of Lambda@Edge (via the `edge` prop). Additionally
+ * it supports environment variables against the Lambda@Edge deployment
+ * despite this being a limitation of Lambda@Edge.
+ *
+ * The browser build and public statics are backed by an S3 Bucket. CloudFront
+ * cache policies are configured, whilst also allowing for customization, and we
+ * include cache invalidation on deployment.
  *
  * The construct enables you to customize many of the deployment features,
  * including the ability to configure a custom domain for the website URL.
  *
- * It also allows you to [automatically set the environment
- * variables](#configuring-environment-variables) in your Remix app directly
+ * It enables you to [automatically set the environment
+ * variables](#configuring-environment-variables) for your Remix app directly
  * from the outputs in your SST app.
  */
 export class RemixSite extends Construct implements SSTConstruct {
@@ -238,8 +247,10 @@ export class RemixSite extends Construct implements SSTConstruct {
    * The default CloudFront cache policy properties for "public" folder
    * static files.
    *
-   * Note: This will not include the browser build files, which have a seperate
-   * cache policy; @see `browserBuildCachePolicyProps`.
+   * @note
+   *
+   * This policy is not applied to the browser build files; they have a seperate
+   * cache policy. @see `browserBuildCachePolicyProps`.
    */
   public static publicCachePolicyProps: cloudfront.CachePolicyProps = {
     queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
@@ -256,6 +267,10 @@ export class RemixSite extends Construct implements SSTConstruct {
   /**
    * The default CloudFront cache policy properties for responses from the
    * server rendering Lambda.
+   *
+   * @note
+   *
+   * By default no caching is performed on the server rendering Lambda response.
    */
   public static serverResponseCachePolicyProps: cloudfront.CachePolicyProps = {
     queryStringBehavior: cloudfront.CacheQueryStringBehavior.all(),
@@ -269,6 +284,9 @@ export class RemixSite extends Construct implements SSTConstruct {
     comment: "SST RemixSite Server Response Default Cache Policy",
   };
 
+  /**
+   * Exposes CDK instances created within the construct.
+   */
   public readonly cdk: {
     /**
      * The internally created CDK `Bucket` instance.
@@ -287,7 +305,11 @@ export class RemixSite extends Construct implements SSTConstruct {
      */
     certificate?: acm.ICertificate;
   };
+  private scope: Construct;
+  private id: string;
   private props: RemixSiteProps;
+  private awsCliLayer: AwsCliLayer;
+
   /**
    * Determines if a placeholder site should be deployed instead. We will set
    * this to `true` by default when performing local development, although the
@@ -302,15 +324,14 @@ export class RemixSite extends Construct implements SSTConstruct {
    * S3Asset references to the zip files containing the static files for the
    * deployment.
    */
-  private deploymentStaticsS3Assets: s3Assets.Asset[];
+  private staticsS3Assets: s3Assets.Asset[];
   /**
    * The remix site config. It contains user configuration overrides which we
    * will need to consider when resolving Remix's build output.
    */
   private remixConfig: RemixConfig;
-  private serverLambdaRole: iam.Role;
-  private serverLambdaVersion: lambda.IVersion;
-  private awsCliLayer: AwsCliLayer;
+  private serverLambdaRole: iam.Role | undefined;
+  private serverFunction: ServerFunction | undefined;
 
   constructor(scope: Construct, id: string, props: RemixSiteProps) {
     super(scope, id);
@@ -319,6 +340,8 @@ export class RemixSite extends Construct implements SSTConstruct {
       const app = scope.node.root as App;
       const zipFileSizeLimitInMb = 200;
 
+      this.scope = scope;
+      this.id = id;
       this.isPlaceholder =
         (app.local || app.skipBuild) && !props.disablePlaceholder;
       this.sstBuildDir = app.buildDir;
@@ -327,77 +350,80 @@ export class RemixSite extends Construct implements SSTConstruct {
       this.awsCliLayer = new AwsCliLayer(this, "AwsCliLayer");
       this.registerSiteEnvironment();
 
-      // Prepare app
-      if (this.isPlaceholder) {
-        // Minimal configuration for the placeholder site
-        this.remixConfig = {} as any;
-        this.deploymentStaticsS3Assets = this.zipAppStubAssets();
-      } else {
-        // Validate application exists
-        if (!fs.existsSync(props.path)) {
-          throw new Error(`No path found`);
-        }
-
-        // Build the Remix site (only if not running an SST test)
-        // @ts-expect-error: "sstTest" is only passed in by SST tests
-        if (!props.sstTest) {
-          this.buildApp();
-        }
-
-        // Read the remix config as we need to ensure we are utilising
-        // any user defined overrides for the Remix build output.
-        this.remixConfig = this.readRemixConfig();
-
-        const serverBuildFile = path.join(
-          this.props.path,
-          this.remixConfig.serverBuildPath
-        );
-
-        // Validate server build output exists
-        if (!fs.existsSync(serverBuildFile)) {
-          throw new Error(
-            `No server build output found at "${serverBuildFile}"`
-          );
-        }
-
-        // Create a directory that we will use to create the bundled version
-        // of the "core server build" along with our custom Lamba@Edge handler.
-        const deploymentWorkingDir = path.join(this.props.path, ".sst");
-        if (fs.existsSync(deploymentWorkingDir)) {
-          fs.removeSync(deploymentWorkingDir);
-        }
-        fs.mkdirSync(deploymentWorkingDir);
-
-        // Create the server lambda code bundle
-        this.createServerBundle();
-
-        // Create S3 assets from the browser build
-        this.deploymentStaticsS3Assets =
-          this.createStaticsS3Assets(zipFileSizeLimitInMb);
-      }
-
       // Create Bucket which will be utilised to contain the statics
       this.cdk.bucket = this.createS3Bucket();
-
-      // Create Lambda@Edge functions (always created in us-east-1)
-      this.serverLambdaRole = this.createServerFunctionRole();
-      this.serverLambdaVersion = this.createServerFunction();
 
       // Create Custom Domain
       this.validateCustomDomainSettings();
       this.cdk.hostedZone = this.lookupHostedZone();
       this.cdk.certificate = this.createCertificate();
 
+      // Prepare app
+      if (this.isPlaceholder) {
+        // Minimal configuration for the placeholder site
+        this.remixConfig = {} as any;
+        this.staticsS3Assets = this.createAppStubS3Assets();
+        this.serverLambdaRole = undefined;
+        this.serverFunction = undefined;
+      } else {
+        // Validate application exists at provided path;
+        if (!fs.existsSync(props.path)) {
+          throw new Error(`No path found`);
+        }
+
+        // Read and validate the remix config to ensure that it follows our
+        // expected conventions;
+        this.remixConfig = RemixSiteUtils.validateRemixConfig({
+          sitePath: props.path,
+        });
+
+        // Build the Remix site (only if not running an SST test);
+        // @ts-expect-error: "sstTest" is only passed in by SST tests
+        if (!props.sstTest) {
+          this.logInfo(`Building site...`);
+          RemixSiteUtils.build({
+            sitePath: props.path,
+            environment: props.environment,
+          });
+        }
+
+        // Create the server lambda handler code
+        this.logInfo(`Injecting server handler alongside server build`);
+        const lambdaSourceMeta = RemixSiteUtils.injectServerHandlerIntoBuild({
+          edge: !!props.edge,
+          sitePath: props.path,
+          remixConfig: this.remixConfig,
+        });
+
+        // Create S3 assets from the browser build;
+        this.staticsS3Assets = this.createStaticsS3Assets(zipFileSizeLimitInMb);
+
+        // Create the server lambda role;
+        this.serverLambdaRole = this.createServerFunctionRole();
+
+        // Create the server lambda;
+        this.serverFunction = props.edge
+          ? this.createEdgeServerFunction({
+              lambdaSourceMeta,
+              sitePath: props.path,
+            })
+          : this.createApigServerFunction({
+              lambdaSourceMeta,
+            });
+      }
+
       // Create S3 Deployment
       const s3deployCR = this.createS3Deployment();
 
-      // Create CloudFront
+      // Create CloudFront Distribution
       this.cdk.distribution = this.createCloudFrontDistribution();
       this.cdk.distribution.node.addDependency(s3deployCR);
 
-      // Invalidate CloudFront
-      const invalidationCR = this.createCloudFrontInvalidation();
-      invalidationCR.node.addDependency(this.cdk.distribution);
+      // Invalidate CloudFront to ensure updates reflect
+      if (!this.isPlaceholder) {
+        const invalidationCR = this.createCloudFrontInvalidation();
+        invalidationCR.node.addDependency(this.cdk.distribution);
+      }
 
       // Connect Custom Domain to CloudFront Distribution
       this.createRoute53Records();
@@ -501,6 +527,9 @@ export class RemixSite extends Construct implements SSTConstruct {
    * ```
    */
   public attachPermissions(permissions: Permissions): void {
+    if (!this.serverLambdaRole) {
+      return;
+    }
     attachPermissionsToRole(this.serverLambdaRole, permissions);
   }
 
@@ -512,51 +541,6 @@ export class RemixSite extends Construct implements SSTConstruct {
         customDomainUrl: this.customDomainUrl,
       },
     };
-  }
-
-  // #endregion
-
-  // #region Building and Bundling
-
-  private buildApp() {
-    // Given that Remix apps tend to involve concatenation of other commands
-    // such as Tailwind compilation, we feel that it is safest to target the
-    // "build" script for the app in order to ensure all outputs are generated.
-
-    const { path: sitePath } = this.props;
-
-    // validate site path exists
-    if (!fs.existsSync(sitePath)) {
-      throw new Error(`No path found at "${path.resolve(sitePath)}"`);
-    }
-
-    // Ensure that the site has a build script defined
-    if (!fs.existsSync(path.join(sitePath, "package.json"))) {
-      throw new Error(`No package.json found at "${sitePath}".`);
-    }
-    const packageJson = readPackageSync({
-      cwd: sitePath,
-      normalize: false,
-    });
-    if (!packageJson.scripts || !packageJson.scripts.build) {
-      throw new Error(
-        `No "build" script found within package.json in "${sitePath}".`
-      );
-    }
-
-    // Run build
-    this.logInfo(`Running "build" script`);
-    const buildResult = spawn.sync("npm", ["run", "build"], {
-      cwd: sitePath,
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        ...getBuildCmdEnvironment(this.props.environment),
-      },
-    });
-    if (buildResult.status !== 0) {
-      throw new Error('The app "build" script failed.');
-    }
   }
 
   // #endregion
@@ -605,7 +589,7 @@ export class RemixSite extends Construct implements SSTConstruct {
     return assets;
   }
 
-  private zipAppStubAssets(): s3Assets.Asset[] {
+  private createAppStubS3Assets(): s3Assets.Asset[] {
     return [
       new s3Assets.Asset(this, "Asset", {
         path: path.resolve(__dirname, "../assets/RemixSite/site-sub"),
@@ -637,9 +621,7 @@ export class RemixSite extends Construct implements SSTConstruct {
       memorySize: 1024,
     });
     this.cdk.bucket.grantReadWrite(uploader);
-    this.deploymentStaticsS3Assets.forEach((asset) =>
-      asset.grantRead(uploader)
-    );
+    this.staticsS3Assets.forEach((asset) => asset.grantRead(uploader));
 
     // Create the custom resource function
     const handler = new lambda.Function(this, "S3Handler", {
@@ -658,49 +640,53 @@ export class RemixSite extends Construct implements SSTConstruct {
     this.cdk.bucket.grantReadWrite(handler);
     uploader.grantInvoke(handler);
 
-    const publicPath = path.join(this.props.path, "public");
-    const publicFileOptions = [];
-    for (const item of fs.readdirSync(publicPath)) {
-      const itemPath = path.join(publicPath, item);
-      publicFileOptions.push({
-        exclude: "*",
-        include: fs.statSync(itemPath).isDirectory()
-          ? `/${item}/*`
-          : `/${item}`,
-        cacheControl: "public,max-age=31536000,must-revalidate",
-      });
-    }
+    let FileOptions;
 
-    // Create custom resource
-    const fileOptions = [
-      {
+    if (!this.isPlaceholder) {
+      const publicPath = path.join(this.props.path, "public");
+      const publicFileOptions = [];
+      for (const item of fs.readdirSync(publicPath)) {
+        const itemPath = path.join(publicPath, item);
+        publicFileOptions.push({
+          exclude: "*",
+          include: fs.statSync(itemPath).isDirectory()
+            ? `/${item}/*`
+            : `/${item}`,
+          cacheControl: "public,max-age=31536000,must-revalidate",
+        });
+      }
+      const browserBuildFileOptions = {
         exclude: "*",
         include: `${this.remixConfig.publicPath}*`,
         cacheControl: "public,max-age=31536000,must-revalidate",
-      },
-      ...publicFileOptions,
-    ];
+      };
+      const fileOptions = [browserBuildFileOptions, ...publicFileOptions];
+
+      FileOptions = (fileOptions || []).map(
+        ({ exclude, include, cacheControl }) => {
+          return [
+            "--exclude",
+            exclude,
+            "--include",
+            include,
+            "--cache-control",
+            cacheControl,
+          ];
+        }
+      );
+    }
+
+    // Create custom resource
     return new CustomResource(this, "S3Deployment", {
       serviceToken: handler.functionArn,
       resourceType: "Custom::SSTBucketDeployment",
       properties: {
-        Sources: this.deploymentStaticsS3Assets.map((asset) => ({
+        Sources: this.staticsS3Assets.map((asset) => ({
           BucketName: asset.s3BucketName,
           ObjectKey: asset.s3ObjectKey,
         })),
         DestinationBucketName: this.cdk.bucket.bucketName,
-        FileOptions: (fileOptions || []).map(
-          ({ exclude, include, cacheControl }) => {
-            return [
-              "--exclude",
-              exclude,
-              "--include",
-              include,
-              "--cache-control",
-              cacheControl,
-            ];
-          }
-        ),
+        FileOptions,
       },
     });
   }
@@ -709,99 +695,18 @@ export class RemixSite extends Construct implements SSTConstruct {
 
   // #region Server Lambda
 
-  private createServerBundle() {
-    // Create a Lambda@Edge handler for the Remix server bundle.
-    //
-    // Note: Remix does perform their own internal ESBuild process, but it
-    // doesn't bundle 3rd party dependencies by default. In the interest of
-    // keeping deployments seamless for users we will create a server bundle
-    // with all dependencies included. We will still need to consider how to
-    // address any need for external dependencies, although I think we should
-    // possibly consider this at a later date.
-
-    let serverPath: string;
-
-    if (this.remixConfig.server != null) {
-      // In this path we are using a user-specified server. We'll assume
-      // that they have built an appropriate CloudFront Lambda@Edge handler
-      // for the Remix "core server build".
-      //
-      // The Remix compiler will have bundled their server implementation into
-      // the server build ouput path. We therefore need to reference the
-      // serverBuildPath from the remix.config.js to determine our server build
-      // entry.
-      //
-      // Supporting this customisation of the server supports two cases:
-      // 1. It enables power users to override our own implementation with an
-      //    implementation that meets their specific needs.
-      // 2. It provides us with the required stepping stone to enable a
-      //    "Serverless Stack" template within the Remix repository (we would
-      //    still need to reach out to the Remix team for this).
-
-      serverPath = this.remixConfig.serverBuildPath;
-    } else {
-      // In this path we are assuming that the Remix build only outputs the
-      // "core server build". We can safely assume this as we have guarded the
-      // remix.config.js to ensure it matches our expectations for the build
-      // configuration.
-      // We need to ensure that the "core server build" is wrapped with an
-      // appropriate Lambda@Edge handler. We will utilise an internal asset
-      // template to create this wrapper within the "core server build" output
-      // directory.
-
-      this.logInfo(`Creating Lambda@Edge handler for server`);
-
-      // Read in our lambda template file
-      const serverTemplate = fs.readFileSync(
-        path.resolve(
-          __dirname,
-          "../assets/RemixSite/server/server-template.js"
-        ),
-        "utf-8"
-      );
-
-      // Resolve the path to create the server lambda handler at.
-      serverPath = path.join(this.props.path, "build/server.js");
-
-      // Write the server lambda
-      fs.writeFileSync(serverPath, serverTemplate, "utf-8");
-    }
-
-    this.logInfo(`Bundling server`);
-
-    const bundleResult = spawn.sync(
-      "npx",
-      [
-        `--no-install`,
-        `esbuild`,
-        `--bundle`,
-        serverPath,
-        `--target=node16`,
-        `--platform=node`,
-        `--outfile=${path.join(this.props.path, ".sst/server.js")}`,
-        `--external:aws-sdk`,
-      ],
-      { stdio: "inherit" }
-    );
-
-    if (bundleResult.error != null) {
-      throw new Error(`There was a problem bundling the server.`);
-    }
-  }
-
   private createServerFunctionRole(): iam.Role {
-    const { defaults } = this.props;
-
-    // Create function role
     const role = new iam.Role(this, `ServerLambdaRole`, {
-      assumedBy: new iam.CompositePrincipal(
-        new iam.ServicePrincipal("lambda.amazonaws.com"),
-        new iam.ServicePrincipal("edgelambda.amazonaws.com")
-      ),
+      assumedBy: this.props.edge
+        ? new iam.CompositePrincipal(
+            new iam.ServicePrincipal("lambda.amazonaws.com"),
+            new iam.ServicePrincipal("edgelambda.amazonaws.com")
+          )
+        : new iam.ServicePrincipal("lambda.amazonaws.com"),
       managedPolicies: [
         iam.ManagedPolicy.fromManagedPolicyArn(
           this,
-          "EdgeLambdaPolicy",
+          "LambdaPolicy",
           "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
         ),
       ],
@@ -809,187 +714,263 @@ export class RemixSite extends Construct implements SSTConstruct {
 
     // Attach permission
     this.cdk.bucket.grantReadWrite(role);
-    if (defaults?.function?.permissions) {
-      attachPermissionsToRole(role, defaults.function.permissions);
+    if (this.props.defaults?.function?.permissions) {
+      attachPermissionsToRole(role, this.props.defaults.function.permissions);
     }
 
     return role;
   }
 
-  private createServerFunction(): lambda.IVersion {
+  private createApigServerFunction(args: {
+    lambdaSourceMeta: LambdaSourceMeta;
+  }): Api {
+    return new Api(this, "Api", {
+      routes: {
+        "ANY /{proxy+}": {
+          function: {
+            srcPath: args.lambdaSourceMeta.directory,
+            handler: args.lambdaSourceMeta.handler,
+            logRetention: logs.RetentionDays.THREE_DAYS,
+            memorySize: this.props.defaults?.function?.memorySize || 512,
+            currentVersionOptions: {
+              removalPolicy: RemovalPolicy.DESTROY,
+            },
+            runtime: "nodejs16.x",
+            timeout: `${this.props.defaults?.function?.timeout || 10} seconds`,
+            role: this.serverLambdaRole,
+            environment: this.props.environment,
+          },
+        },
+      },
+    });
+  }
+
+  private createEdgeServerFunction(args: {
+    lambdaSourceMeta: LambdaSourceMeta;
+    sitePath: string;
+  }): lambda.IVersion {
+    // Note: this function is a bit heavy. I intentionally moved everything into
+    // it to make it much more clear where the responsibility boundary is, so
+    // that we can hopefully transistion this method into a pure method, and
+    // then finally move it out into an abstraction that can be reused by other
+    // constructs. We need to get rid of "this" everywhere.
+
     const name = "Server";
 
-    const assetPath = this.isPlaceholder
-      ? path.resolve(__dirname, "../assets/RemixSite/server-lambda-stub")
-      : path.join(this.props.path, ".sst");
+    const createEdgeServerBundleAsset = (args: {
+      lambdaSourceMeta: LambdaSourceMeta;
+      sitePath: string;
+    }) => {
+      this.logInfo(`Bundling server`);
 
-    // Create function asset
-    const asset = new s3Assets.Asset(this, `ServerFunctionAsset`, {
-      path: assetPath,
-    });
+      const localId = path.posix
+        .join(this.scope.node.path, this.id)
+        .replace(/\$/g, "-")
+        .replace(/\//g, "-")
+        .replace(/\./g, "-");
+
+      const bundle =
+        this.props.bundle === undefined ? undefined : this.props.bundle;
+      if (!bundle && args.sitePath === ".") {
+        throw new Error(
+          `Bundle cannot be disabled for the "${this.id}" function since the "srcPath" is set to the project root. Read more here — https://github.com/serverless-stack/sst/issues/78`
+        );
+      }
+
+      const bundled = Runtime.Handler.bundle({
+        id: localId,
+        root: this.props.path,
+        handler: args.lambdaSourceMeta.handler,
+        runtime: lambda.Runtime.NODEJS_16_X.toString(),
+        srcPath: args.lambdaSourceMeta.directory,
+        bundle,
+      })!;
+
+      if (!("directory" in bundled)) {
+        throw new Error(`Server bundle produced unexpected output`);
+      }
+
+      Function.copyFiles(
+        bundle,
+        args.lambdaSourceMeta.directory,
+        bundled.directory
+      );
+
+      return {
+        asset: new s3Assets.Asset(this, `ServerFunctionAsset`, {
+          path: bundled.directory,
+        }),
+        directory: bundled.directory,
+        handler: bundled.handler,
+      };
+    };
+
+    const createEdgeLambdaCodeReplacer = (
+      name: string,
+      asset: s3Assets.Asset
+    ): CustomResource => {
+      // Note: Source code for the Lambda functions have "{{ ENV_KEY }}" in them.
+      //       They need to be replaced with real values before the Lambda
+      //       functions get deployed.
+
+      const providerId = "LambdaCodeReplacerProvider";
+      const resId = `${name}LambdaCodeReplacer`;
+      const stack = Stack.of(this);
+      let provider = stack.node.tryFindChild(providerId) as lambda.Function;
+
+      // Create provider if not already created
+      if (!provider) {
+        provider = new lambda.Function(stack, providerId, {
+          code: lambda.Code.fromAsset(
+            // TODO: Move this file into a shared folder
+            // This references a Nextjs directory, but the underlying
+            // code appears to be generic enough to utilise in this case.
+            path.join(__dirname, "../assets/NextjsSite/custom-resource")
+          ),
+          layers: [this.awsCliLayer],
+          runtime: lambda.Runtime.PYTHON_3_7,
+          handler: "lambda-code-updater.handler",
+          timeout: Duration.minutes(15),
+          memorySize: 1024,
+        });
+      }
+
+      // Allow provider to perform search/replace on the asset
+      provider.role?.addToPrincipalPolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["s3:*"],
+          resources: [
+            `arn:aws:s3:::${asset.s3BucketName}/${asset.s3ObjectKey}`,
+          ],
+        })
+      );
+
+      // Create custom resource
+      const resource = new CustomResource(this, resId, {
+        serviceToken: provider.functionArn,
+        resourceType: "Custom::SSTLambdaCodeUpdater",
+        properties: {
+          Source: {
+            BucketName: asset.s3BucketName,
+            ObjectKey: asset.s3ObjectKey,
+          },
+          ReplaceValues: [
+            {
+              files: "**/*.js",
+              search: '"{{ _SST_REMIX_SITE_ENVIRONMENT_ }}"',
+              replace: JSON.stringify(this.props.environment || {}),
+            },
+          ],
+        },
+      });
+
+      return resource;
+    };
+
+    const createEdgeServerFunctionInUE1 = (
+      name: string,
+      asset: s3Assets.Asset,
+      assetPath: string,
+      handler: string
+    ): lambda.IVersion => {
+      const { defaults } = this.props;
+
+      // Create function
+      const fn = new lambda.Function(this, `${name}Function`, {
+        description: `${name} handler for Remix`,
+        handler,
+        currentVersionOptions: {
+          removalPolicy: RemovalPolicy.DESTROY,
+        },
+        logRetention: logs.RetentionDays.THREE_DAYS,
+        code: lambda.Code.fromAsset(assetPath),
+        runtime: lambda.Runtime.NODEJS_16_X,
+        memorySize: defaults?.function?.memorySize || 512,
+        timeout: Duration.seconds(defaults?.function?.timeout || 10),
+        role: this.serverLambdaRole,
+      });
+
+      // Create alias
+      fn.currentVersion.addAlias("live");
+
+      // Deploy after the code is updated
+      if (!this.isPlaceholder) {
+        const updaterCR = createEdgeLambdaCodeReplacer(name, asset);
+        fn.node.addDependency(updaterCR);
+      }
+
+      return fn.currentVersion;
+    };
+
+    const createEdgeServerFunctionInNonUE1 = (
+      name: string,
+      asset: s3Assets.Asset,
+      _assetPath: string,
+      handler: string
+    ): lambda.IVersion => {
+      const { defaults } = this.props;
+
+      // If app region is NOT us-east-1, create a Function in us-east-1
+      // using a Custom Resource
+
+      // Create a S3 bucket in us-east-1 to store Lambda code. Create
+      // 1 bucket for all Edge functions.
+      const bucketCR = crossRegionHelper.getOrCreateBucket(this);
+      const bucketName = bucketCR.getAttString("BucketName");
+
+      // Create a Lambda function in us-east-1
+      const functionCR = crossRegionHelper.createFunction(
+        this,
+        name,
+        this.serverLambdaRole!,
+        bucketName,
+        {
+          Description: `${name} handler for Remix`,
+          Handler: handler,
+          Code: {
+            S3Bucket: asset.s3BucketName,
+            S3Key: asset.s3ObjectKey,
+          },
+          Runtime: lambda.Runtime.NODEJS_16_X.name,
+          MemorySize: defaults?.function?.memorySize || 512,
+          Timeout: Duration.seconds(
+            defaults?.function?.timeout || 10
+          ).toSeconds(),
+          Role: this.serverLambdaRole!.roleArn,
+        }
+      );
+      const functionArn = functionCR.getAttString("FunctionArn");
+
+      // Create a Lambda function version in us-east-1
+      const versionCR = crossRegionHelper.createVersion(
+        this,
+        name,
+        functionArn
+      );
+      const versionId = versionCR.getAttString("Version");
+      crossRegionHelper.updateVersionLogicalId(functionCR, versionCR);
+
+      // Deploy after the code is updated
+      if (!this.isPlaceholder) {
+        const updaterCR = createEdgeLambdaCodeReplacer(name, asset);
+        functionCR.node.addDependency(updaterCR);
+      }
+
+      return lambda.Version.fromVersionArn(
+        this,
+        `${name}FunctionVersion`,
+        `${functionArn}:${versionId}`
+      );
+    };
+
+    const { asset, directory, handler } = createEdgeServerBundleAsset(args);
 
     // Create function based on region
     const root = this.node.root as App;
     return root.region === "us-east-1"
-      ? this.createServerFunctionInUE1(name, asset, assetPath)
-      : this.createServerFunctionInNonUE1(name, asset, assetPath);
-  }
-
-  private createServerFunctionInUE1(
-    name: string,
-    asset: s3Assets.Asset,
-    assetPath: string
-  ): lambda.IVersion {
-    const { defaults } = this.props;
-
-    // Create function
-    const fn = new lambda.Function(this, `${name}Function`, {
-      description: `${name} handler for Remix`,
-      handler: "server.handler",
-      currentVersionOptions: {
-        removalPolicy: RemovalPolicy.DESTROY,
-      },
-      logRetention: logs.RetentionDays.THREE_DAYS,
-      code: lambda.Code.fromAsset(assetPath),
-      runtime: lambda.Runtime.NODEJS_16_X,
-      memorySize: defaults?.function?.memorySize || 512,
-      timeout: Duration.seconds(defaults?.function?.timeout || 10),
-      role: this.serverLambdaRole,
-    });
-
-    // Create alias
-    fn.currentVersion.addAlias("live");
-
-    // Deploy after the code is updated
-    if (!this.isPlaceholder) {
-      const updaterCR = this.createLambdaCodeReplacer(name, asset);
-      fn.node.addDependency(updaterCR);
-    }
-
-    return fn.currentVersion;
-  }
-
-  private createServerFunctionInNonUE1(
-    name: string,
-    asset: s3Assets.Asset,
-    _assetPath: string
-  ): lambda.IVersion {
-    const { defaults } = this.props;
-
-    // If app region is NOT us-east-1, create a Function in us-east-1
-    // using a Custom Resource
-
-    // Create a S3 bucket in us-east-1 to store Lambda code. Create
-    // 1 bucket for all Edge functions.
-    const bucketCR = crossRegionHelper.getOrCreateBucket(this);
-    const bucketName = bucketCR.getAttString("BucketName");
-
-    // Create a Lambda function in us-east-1
-    const functionCR = crossRegionHelper.createFunction(
-      this,
-      name,
-      this.serverLambdaRole,
-      bucketName,
-      {
-        Description: `${name} handler for Remix`,
-        Handler: "server.handler",
-        Code: {
-          S3Bucket: asset.s3BucketName,
-          S3Key: asset.s3ObjectKey,
-        },
-        Runtime: lambda.Runtime.NODEJS_16_X.name,
-        MemorySize: defaults?.function?.memorySize || 512,
-        Timeout: Duration.seconds(
-          defaults?.function?.timeout || 10
-        ).toSeconds(),
-        Role: this.serverLambdaRole.roleArn,
-      }
-    );
-    const functionArn = functionCR.getAttString("FunctionArn");
-
-    // Create a Lambda function version in us-east-1
-    const versionCR = crossRegionHelper.createVersion(this, name, functionArn);
-    const versionId = versionCR.getAttString("Version");
-    crossRegionHelper.updateVersionLogicalId(functionCR, versionCR);
-
-    // Deploy after the code is updated
-    if (!this.isPlaceholder) {
-      const updaterCR = this.createLambdaCodeReplacer(name, asset);
-      functionCR.node.addDependency(updaterCR);
-    }
-
-    return lambda.Version.fromVersionArn(
-      this,
-      `${name}FunctionVersion`,
-      `${functionArn}:${versionId}`
-    );
-  }
-
-  private createLambdaCodeReplacer(
-    name: string,
-    asset: s3Assets.Asset
-  ): CustomResource {
-    // Note: Source code for the Lambda functions have "{{ ENV_KEY }}" in them.
-    //       They need to be replaced with real values before the Lambda
-    //       functions get deployed.
-
-    const providerId = "LambdaCodeReplacerProvider";
-    const resId = `${name}LambdaCodeReplacer`;
-    const stack = Stack.of(this);
-    let provider = stack.node.tryFindChild(providerId) as lambda.Function;
-
-    // Create provider if not already created
-    if (!provider) {
-      provider = new lambda.Function(stack, providerId, {
-        code: lambda.Code.fromAsset(
-          // TODO: Move this file into a shared folder
-          // This references a Nextjs directory, but the underlying
-          // code appears to be generic enough to utilise in this case.
-          path.join(__dirname, "../assets/NextjsSite/custom-resource")
-        ),
-        layers: [this.awsCliLayer],
-        runtime: lambda.Runtime.PYTHON_3_7,
-        handler: "lambda-code-updater.handler",
-        timeout: Duration.minutes(15),
-        memorySize: 1024,
-      });
-    }
-
-    // Allow provider to perform search/replace on the asset
-    provider.role?.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ["s3:*"],
-        resources: [`arn:aws:s3:::${asset.s3BucketName}/${asset.s3ObjectKey}`],
-      })
-    );
-
-    // Create custom resource
-    const resource = new CustomResource(this, resId, {
-      serviceToken: provider.functionArn,
-      resourceType: "Custom::SSTLambdaCodeUpdater",
-      properties: {
-        Source: {
-          BucketName: asset.s3BucketName,
-          ObjectKey: asset.s3ObjectKey,
-        },
-        ReplaceValues: this.getLambdaContentReplaceValues(),
-      },
-    });
-
-    return resource;
-  }
-
-  private getLambdaContentReplaceValues(): BaseSiteReplaceProps[] {
-    const replaceValues: BaseSiteReplaceProps[] = [];
-
-    replaceValues.push({
-      files: "**/*.js",
-      search: '"{{ _SST_REMIX_SITE_ENVIRONMENT_ }}"',
-      replace: JSON.stringify(this.props.environment || {}),
-    });
-
-    return replaceValues;
+      ? createEdgeServerFunctionInUE1(name, asset, directory, handler)
+      : createEdgeServerFunctionInNonUE1(name, asset, directory, handler);
   }
 
   // #endregion
@@ -1022,11 +1003,11 @@ export class RemixSite extends Construct implements SSTConstruct {
       domainNames.push(customDomain.domainName);
     }
 
-    // Build behavior
     const origin = new origins.S3Origin(this.cdk.bucket);
     const viewerProtocolPolicy =
       cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS;
 
+    // Return the placeholder site if intended to be a placeholder;
     if (this.isPlaceholder) {
       return new cloudfront.Distribution(this, "Distribution", {
         defaultRootObject: "index.html",
@@ -1040,19 +1021,6 @@ export class RemixSite extends Construct implements SSTConstruct {
       });
     }
 
-    // Build Edge functions
-    const edgeLambdas: cloudfront.EdgeLambda[] = [
-      {
-        includeBody: true,
-        eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
-        functionVersion: this.serverLambdaVersion,
-      },
-      {
-        eventType: cloudfront.LambdaEdgeEventType.ORIGIN_RESPONSE,
-        functionVersion: this.serverLambdaVersion,
-      },
-    ];
-
     // Build cache policies
     const browserBuildCachePolicy =
       cdk?.cachePolicies?.browserBuildCachePolicy ??
@@ -1064,7 +1032,52 @@ export class RemixSite extends Construct implements SSTConstruct {
       cdk?.cachePolicies?.serverResponseCachePolicy ??
       this.createCloudFrontServerResponseCachePolicy();
 
-    // Behaviour options for public assets
+    let defaultBehavior: BehaviorOptions;
+
+    if (this.serverFunction instanceof Api) {
+      const apiId = this.serverFunction.httpApiId;
+      const region = Stack.of(this).region;
+      const urlSuffix = Stack.of(this).urlSuffix;
+      const apiDomain = `${apiId}.execute-api.${region}.${urlSuffix}`;
+      defaultBehavior = {
+        viewerProtocolPolicy,
+        origin: new origins.HttpOrigin(apiDomain),
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+        cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
+        compress: true,
+        cachePolicy: serverResponseCachePolicy,
+        ...(cfDistributionProps.defaultBehavior || {}),
+      };
+    } else if (this.serverFunction != null) {
+      defaultBehavior = {
+        viewerProtocolPolicy,
+        origin,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+        cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
+        compress: true,
+        cachePolicy: serverResponseCachePolicy,
+        ...(cfDistributionProps.defaultBehavior || {}),
+        edgeLambdas: [
+          {
+            includeBody: true,
+            eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
+            functionVersion: this.serverFunction,
+          },
+          {
+            eventType: cloudfront.LambdaEdgeEventType.ORIGIN_RESPONSE,
+            functionVersion: this.serverFunction,
+          },
+          ...(cfDistributionProps.defaultBehavior?.edgeLambdas || []),
+        ],
+      };
+    } else {
+      throw new Error('Internal error: "serverFunction" not set');
+    }
+
+    const additionalBehaviours: Record<string, cloudfront.BehaviorOptions> = {};
+
+    // Create additional behaviours for public folder statics
+    const publicPath = path.join(this.props.path, "public");
     const publicBehaviourOptions: cloudfront.BehaviorOptions = {
       viewerProtocolPolicy,
       origin,
@@ -1073,21 +1086,17 @@ export class RemixSite extends Construct implements SSTConstruct {
       compress: true,
       cachePolicy: publicCachePolicy,
     };
-
-    // Create additional behaviours for statics
-    const publicPath = path.join(this.props.path, "public");
-    const staticsBehaviours: Record<string, cloudfront.BehaviorOptions> = {};
     for (const item of fs.readdirSync(publicPath)) {
       if (item === "build") {
         // This is the browser build, so it will have its own cache policy
-        staticsBehaviours["/build/*"] = {
+        additionalBehaviours["/build/*"] = {
           ...publicBehaviourOptions,
           cachePolicy: browserBuildCachePolicy,
         };
       } else {
         // This is a public asset, so it will use the public cache policy
         const itemPath = path.join(publicPath, item);
-        staticsBehaviours[
+        additionalBehaviours[
           fs.statSync(itemPath).isDirectory() ? `/${item}/*` : `/${item}`
         ] = publicBehaviourOptions;
       }
@@ -1102,22 +1111,9 @@ export class RemixSite extends Construct implements SSTConstruct {
       // these values can NOT be overwritten by cfDistributionProps
       domainNames,
       certificate: this.cdk.certificate,
-      defaultBehavior: {
-        viewerProtocolPolicy,
-        origin,
-        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
-        cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
-        compress: true,
-        cachePolicy: serverResponseCachePolicy,
-        ...(cfDistributionProps.defaultBehavior || {}),
-        // concatenate edgeLambdas
-        edgeLambdas: [
-          ...edgeLambdas,
-          ...(cfDistributionProps.defaultBehavior?.edgeLambdas || []),
-        ],
-      },
+      defaultBehavior,
       additionalBehaviors: {
-        ...staticsBehaviours,
+        ...additionalBehaviours,
         ...(cfDistributionProps.additionalBehaviors || {}),
       },
     });
@@ -1220,7 +1216,6 @@ export class RemixSite extends Construct implements SSTConstruct {
       properties: {
         BuildId: versionId,
         DistributionId: this.cdk.distribution.distributionId,
-        // TODO: Ignore the browser build path as it may speed up invalidation
         DistributionPaths: ["/*"],
         WaitForInvalidation: waitForInvalidation,
       },
@@ -1390,49 +1385,6 @@ export class RemixSite extends Construct implements SSTConstruct {
       stack: Stack.of(this).node.id,
       environmentOutputs,
     } as BaseSiteEnvironmentOutputsInfo);
-  }
-
-  private readRemixConfig(): RemixConfig {
-    const { path: sitePath } = this.props;
-
-    const result = spawn.sync("node", [
-      path.resolve(
-        __dirname,
-        "../assets/RemixSite/config/read-remix-config.cjs"
-      ),
-      "--path",
-      path.resolve(sitePath, "remix.config.js"),
-    ]);
-    if (result.error != null) {
-      throw new Error(`Failed to read the Remix config file.\n${result.error}`);
-    }
-    if (result.status !== 0) {
-      throw new Error(
-        `Failed to read the Remix config file.\n${result.stderr}`
-      );
-    }
-    const output = result.stdout.toString();
-
-    const remixConfigParse = expectedRemixConfigSchema.safeParse(
-      JSON.parse(output)
-    );
-    if (remixConfigParse.success === false) {
-      throw new Error(
-        `\nYour remix.config.js has invalid values.
-
-It needs to use the default Remix config values for the following properties:
-
-module.exports ={
-  assetsBuildDirectory: "public/build",
-  publicPath: "/build/",
-  serverBuildPath: "build/index.js",
-  serverBuildTarget: "node-cjs",
-  server: undefined,
-}
-`
-      );
-    }
-    return remixConfigParse.data;
   }
 
   private logInfo(msg: string) {
