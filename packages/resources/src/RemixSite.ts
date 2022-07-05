@@ -652,13 +652,13 @@ export class RemixSite extends Construct implements SSTConstruct {
           include: fs.statSync(itemPath).isDirectory()
             ? `/${item}/*`
             : `/${item}`,
-          cacheControl: "public,max-age=31536000,must-revalidate",
+          cacheControl: "public,max-age=3600,must-revalidate",
         });
       }
       const browserBuildFileOptions = {
         exclude: "*",
         include: `${this.remixConfig.publicPath}*`,
-        cacheControl: "public,max-age=31536000,must-revalidate",
+        cacheControl: "public,max-age=31536000,immutable",
       };
       const fileOptions = [browserBuildFileOptions, ...publicFileOptions];
 
@@ -1061,10 +1061,6 @@ export class RemixSite extends Construct implements SSTConstruct {
           {
             includeBody: true,
             eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
-            functionVersion: this.serverFunction,
-          },
-          {
-            eventType: cloudfront.LambdaEdgeEventType.ORIGIN_RESPONSE,
             functionVersion: this.serverFunction,
           },
           ...(cfDistributionProps.defaultBehavior?.edgeLambdas || []),
